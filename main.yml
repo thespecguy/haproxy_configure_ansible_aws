@@ -1,0 +1,172 @@
+- hosts: localhost
+  gather_facts: no
+  vars_files:
+    - vars.yml
+  tasks:
+  - name:
+    pip:
+      name: boto3
+      state: present
+
+  - name: Creation of VPC for EC2 Instance
+    ec2_vpc_net:
+      aws_access_key: "{{ aws_access_key }}"
+      aws_secret_key: "{{ aws_secret_key }}"
+      region: "{{ region }}"
+      name: "{{ vpc_name}}"
+      cidr_block: "{{ cidr_block_vpc }}"
+      state: present
+    register: ec2_vpc
+
+  - name: Internet Gateway for VPC
+    ec2_vpc_igw:
+      aws_access_key: "{{ aws_access_key }}"
+      aws_secret_key: "{{ aws_secret_key }}"
+      region: "{{ region }}"
+      state: present
+      vpc_id: "{{ ec2_vpc.vpc.id  }}"
+      tags:
+        Name: "{{ igw_name }}"
+    register: igw_info
+
+  - name: VPC Subnet Creation
+    ec2_vpc_subnet:
+      aws_access_key: "{{ aws_access_key }}"
+      aws_secret_key: "{{ aws_secret_key }}"
+      region: "{{ region }}"
+      vpc_id: "{{ ec2_vpc.vpc.id  }}"
+      az: "{{ availability_zone }}"
+      state: present
+      cidr: "{{ cidr_subnet  }}"
+      map_public: yes
+      tags:
+        Name: "{{ subnet_name }}"
+    register: subnet_info
+
+  - name: Creation of VPC Subnet Route Table
+    ec2_vpc_route_table:
+      aws_access_key: "{{ aws_access_key }}"
+      aws_secret_key: "{{ aws_secret_key }}"
+      region: "{{ region }}"
+      vpc_id: "{{ ec2_vpc.vpc.id  }}"
+      state: present
+      tags:
+        Name: "{{ route_table_name }}"
+      subnets: [ "{{ subnet_info.subnet.id }}" ]
+
+      routes:
+        - dest: 0.0.0.0/0
+          gateway_id: "{{ igw_info.gateway_id }}" 
+
+  - name: Security Group Creation
+    ec2_group:
+      aws_access_key: "{{ aws_access_key }}"
+      aws_secret_key: "{{ aws_secret_key }}"
+      region: "{{ region }}"
+      name: "{{ sg_name  }}"
+      vpc_id: "{{ ec2_vpc.vpc.id  }}"
+      state: present
+      description: Security Group for both Loadbalancer & Webserver
+      tags:
+        Name: "{{ sg_name  }}"
+      rules:
+      - proto: tcp
+        ports:
+          - 80
+          - 8080
+          - 22
+        cidr_ip: 0.0.0.0/0
+    register: security_group_info
+
+  - name: Creation of EC2 Instance for Load Balancer
+    ec2:
+      aws_access_key: "{{ aws_access_key }}"
+      aws_secret_key: "{{ aws_secret_key }}"
+      region: "{{ region }}"
+      image: "{{ image_id }}"
+      exact_count: 1
+      instance_type: "{{ instance_type }}"
+      vpc_subnet_id: "{{ subnet_info.subnet.id }}"
+      key_name: "{{ key_name }}"
+      group_id: "{{ security_group_info.group_id  }}"
+      wait: yes
+      wait_timeout: 600
+      instance_tags:
+        Name: loadbalancer
+      count_tag:
+        Name: loadbalancer
+
+  - name: Creation of EC2 Instance for Web Server
+    ec2:
+      aws_access_key: "{{ aws_access_key }}"
+      aws_secret_key: "{{ aws_secret_key }}"
+      region: "{{ region }}"
+      image: "{{ image_id }}"
+      instance_type: "{{ instance_type }}"
+      vpc_subnet_id: "{{ subnet_info.subnet.id }}"
+      key_name: "{{ key_name }}"
+      group_id: "{{ security_group_info.group_id  }}"
+      exact_count: "{{ instance_count }}"
+      wait: yes
+      wait_timeout: 600
+      instance_tags:
+        Name: webserver
+      count_tag:
+        Name: webserver
+    ignore_errors: yes
+
+  - meta: refresh_inventory
+
+  - pause:
+      minutes: 2  
+
+- hosts: tag_Name_loadbalancer
+  vars_files:
+    - vars.yml  
+  remote_user: "{{ remote_user }}"
+  tasks:
+  - name: Installation of HAProxy Software
+    package:
+      name: "haproxy"
+      state: present
+
+  - name: HAProxy Configuration File Setup
+    template:
+      dest: "/etc/haproxy/haproxy.cfg"
+      src: "templates/haproxy.cfg"
+    notify: Restart Load Balancer
+
+  - name: Starting Load Balancer Service
+    service:
+      name: "haproxy"
+      state: started
+      enabled: yes
+
+  handlers:
+    - name: Restart Load Balancer
+      systemd:
+        name: "haproxy"
+        state: restarted
+        enabled: yes
+
+
+- hosts: tag_Name_webserver
+  vars_files:
+    - vars.yml
+  remote_user: "{{ remote_user }}"
+  tasks:
+  - name: HTTPD Installation
+    package: 
+      name: "httpd"
+      state: present
+
+  - name: Web Page Setup
+    template:
+      dest: "/var/www/html"
+      src: "web/index.html"
+
+  - name: Starting HTTPD Service
+    service:
+      name: "httpd"
+      state: started
+      enabled: yes
